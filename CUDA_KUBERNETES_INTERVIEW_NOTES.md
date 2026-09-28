@@ -610,3 +610,194 @@ For a Kubernetes platform engineer, the strongest position is:
 ```
 
 If this stack is clear, most Kubernetes + CUDA interview questions become much easier to reason through.
+
+
+---
+
+# MIG and GPU Time-Slicing — Kubernetes Configuration
+
+## MIG vs Time-Slicing
+
+**MIG (Multi-Instance GPU)** partitions a supported NVIDIA GPU into isolated GPU instances with defined compute/memory resources. **Time-slicing** does not physically partition the GPU; multiple workloads share execution time on the same GPU.
+
+| Area | MIG | Time-Slicing |
+|---|---|---|
+| Physical partitioning | Yes, supported GPUs only | No |
+| Isolation | Stronger | Lower |
+| Predictability | Better | Lower |
+| Model | Separate GPU instances | Same GPU shared over time |
+| Typical use | Production workloads needing isolation | Smaller/intermittent/dev/inference workloads |
+
+## Normal Dedicated GPU Pod
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-app
+spec:
+  containers:
+  - name: app
+    image: my-ai-app:latest
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+```
+
+## MIG at Kubernetes YAML Level
+
+MIG is **not created by application Pod YAML**. The platform administrator configures MIG on a supported GPU. NVIDIA Device Plugin/GPU Operator then advertises the resulting MIG resources to Kubernetes.
+
+Depending on the GPU and configuration, resources may look like:
+
+```text
+nvidia.com/mig-1g.10gb
+nvidia.com/mig-2g.20gb
+```
+
+The exact profile names depend on the GPU model/configuration.
+
+A workload then requests an advertised MIG resource:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/mig-1g.10gb: 1
+```
+
+```text
+Platform Admin
+      ↓
+Configure MIG on GPU
+      ↓
+GPU Operator / Device Plugin
+      ↓
+Advertises MIG resources
+      ↓
+Kubernetes Scheduler
+      ↓
+Pod requests required MIG profile
+```
+
+The Pod **requests** a MIG instance; it does not create the partition.
+
+## Where Time-Slicing Is Configured
+
+Time-slicing is also **not configured in the application Pod**. It is configured at the **NVIDIA Device Plugin layer**, commonly through a ConfigMap and, in GPU Operator environments, through device-plugin configuration managed/referenced by the operator.
+
+Example device-plugin configuration:
+
+```yaml
+version: v1
+sharing:
+  timeSlicing:
+    resources:
+    - name: nvidia.com/gpu
+      replicas: 4
+```
+
+Example ConfigMap structure:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvidia-device-plugin-config
+  namespace: nvidia-device-plugin
+data:
+  config.yaml: |
+    version: v1
+    sharing:
+      timeSlicing:
+        resources:
+        - name: nvidia.com/gpu
+          replicas: 4
+```
+
+The exact namespace, ConfigMap name and how it is referenced depend on how NVIDIA Device Plugin/GPU Operator is installed.
+
+```text
+Device Plugin ConfigMap
+        |
+        | timeSlicing
+        | replicas: 4
+        ↓
+NVIDIA Device Plugin
+        ↓
+GPU Worker Node
+        ↓
+Multiple schedulable shared references
+        ↓
+Kubernetes Scheduler
+        ↓
+Application Pod requests nvidia.com/gpu: 1
+```
+
+### What does replicas: 4 mean?
+
+It does **not** create four GPUs, divide the GPU into guaranteed 25% partitions, or provide MIG-style hardware isolation. It makes each physical GPU available as multiple schedulable shared references according to the device-plugin time-slicing configuration.
+
+```text
+1 Physical GPU
+      |
+timeSlicing replicas: 4
+      |
+ +----+----+----+----+
+ |    |    |    |    |
+Pod1 Pod2 Pod3 Pod4
+       share
+    the same GPU
+```
+
+The application can still request:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 1
+```
+
+## Two Configuration Layers
+
+```text
+PLATFORM CONFIGURATION
+        |
+        +-- GPU Operator / Device Plugin
+        +-- MIG configuration
+        +-- Time-slicing configuration / ConfigMap
+                     ↓
+            Advertised GPU resources
+                     ↓
+APPLICATION POD YAML
+        |
+        +-- nvidia.com/gpu: 1
+        OR
+        +-- exposed MIG profile
+```
+
+**Platform team controls how GPUs are exposed/shared. Application teams request the GPU resource they need.**
+
+## Useful Checks
+
+```bash
+kubectl get pods -A | grep -i nvidia
+kubectl get daemonset -A | grep -i nvidia
+kubectl get configmap -A | grep -i nvidia
+kubectl describe node <gpu-node>
+```
+
+Look under node **Capacity** and **Allocatable** for NVIDIA resources.
+
+## Interview Answers
+
+**Where is time-slicing configured?**
+
+> I configure time-slicing at the NVIDIA device-plugin layer, normally through a ConfigMap referenced by the NVIDIA Device Plugin or managed through GPU Operator. It is platform-level configuration, not application Pod configuration. The application can continue requesting nvidia.com/gpu: 1 while the device plugin controls how the physical GPU is exposed for sharing.
+
+**MIG vs time-slicing?**
+
+> MIG partitions a supported NVIDIA GPU into isolated GPU instances with stronger isolation and predictability. Time-slicing does not physically partition the GPU; multiple workloads share execution time on the same GPU. I would consider MIG where isolation and predictable resources matter and time-slicing where improving utilization for smaller/intermittent workloads is the priority.
+
+**How is MIG configured?**
+
+> MIG is configured at the GPU/platform layer, not by the application Pod. After the GPU is placed into the required MIG configuration, NVIDIA Device Plugin or GPU Operator exposes the MIG instances to Kubernetes. The application then requests the appropriate advertised MIG resource.
